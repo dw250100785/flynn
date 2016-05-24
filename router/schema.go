@@ -149,5 +149,61 @@ CREATE TRIGGER check_http_route_update
 		`ALTER TABLE tcp_routes ADD COLUMN leader boolean NOT NULL DEFAULT FALSE`,
 		`ALTER TABLE http_routes ADD COLUMN leader boolean NOT NULL DEFAULT FALSE`,
 	)
+	m.Add(5,
+		`CREATE TABLE certificates (
+			id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+			cert text NOT NULL,
+			key text NOT NULL,
+			cert_sha256 text NOT NULL,
+			created_at timestamptz NOT NULL DEFAULT now(),
+			updated_at timestamptz NOT NULL DEFAULT now(),
+			deleted_at timestamptz
+		)`,
+		`CREATE UNIQUE INDEX ON certificates (cert_sha256) WHERE deleted_at IS NULL`,
+		`CREATE TABLE route_certificates (
+			http_route_id uuid NOT NULL REFERENCES http_routes (id) ON DELETE CASCADE,
+			certificate_id uuid NOT NULL REFERENCES certificates (id) ON DELETE RESTRICT,
+			PRIMARY KEY (http_route_id, certificate_id)
+		)`,
+		// Create certificate for http_routes with tls_key set,
+		// taking care not to create duplicates
+		`DO $$
+		DECLARE
+			http_route RECORD;
+			certificate_id uuid;
+		BEGIN
+			FOR http_route IN SELECT * FROM http_routes WHERE tls_key IS NOT NULL LOOP
+				SELECT INTO certificate_id id FROM certificates WHERE key = http_route.tls_key AND cert = http_route.tls_cert;
+
+				IF NOT FOUND THEN
+					INSERT INTO certificates (cert, key)
+					VALUES (http_route.tls_cert, http_route.tls_key)
+					RETURNING id INTO certificate_id;
+				END IF;
+
+				INSERT INTO route_certificates (http_route_id, certificate_id) VALUES(http_route.id, certificate_id);
+			END LOOP;
+		END $$`,
+		`ALTER TABLE http_routes DROP COLUMN tls_cert`,
+		`ALTER TABLE http_routes DROP COLUMN tls_key`,
+		`
+CREATE OR REPLACE FUNCTION notify_route_certificates_update() RETURNS TRIGGER AS $$
+BEGIN
+	IF (TG_OP = 'DELETE') THEN
+		PERFORM pg_notify('http_routes', OLD.http_route_id::varchar);
+	ELSIF (TG_OP = 'UPDATE') THEN
+		PERFORM pg_notify('http_routes', OLD.http_route_id::varchar);
+		PERFORM pg_notify('http_routes', NEW.http_route_id::varchar);
+	ELSIF (TG_OP = 'INSERT') THEN
+		PERFORM pg_notify('http_routes', NEW.http_route_id::varchar);
+	END IF;
+	RETURN NULL;
+END;
+$$ LANGUAGE plpgsql`,
+		`
+CREATE TRIGGER notify_route_certificates_update
+	AFTER INSERT OR UPDATE OR DELETE ON route_certificates
+	FOR EACH ROW EXECUTE PROCEDURE notify_route_certificates_update()`,
+	)
 	return m.Migrate(db)
 }
